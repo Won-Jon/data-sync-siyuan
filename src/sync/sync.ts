@@ -86,6 +86,14 @@ export class SyncManager {
      */
     private webSocketRequestIds: Set<string> = new Set();
 
+    /**
+     * Counters for tracking deleted files during sync.
+     * localDeleted: number of files deleted locally
+     * remoteDeleted: number of files deleted remotely
+     */
+    private localDeleted: number = 0;
+    private remoteDeleted: number = 0;
+
     private syncStatus: SyncStatus = SyncStatus.None;
     private statusCallbacks: SyncStatusCallback[] = [];
 
@@ -993,14 +1001,40 @@ export class SyncManager {
                     "error"
                 );
             } else if (this.conflictDetected) {
+                const localModified = this.locallyUpdatedFiles.size;
+                const remoteModified = this.remotelyUpdatedFiles.size;
+                const localDeleted = this.localDeleted;
+                const remoteDeleted = this.remoteDeleted;
+
                 if (persistentMessage)
-                    showMessage(this.plugin.i18n.syncCompletedWithConflicts.replace("{{duration}}", duration), 6000);
-                consoleWarn(`Sync completed with conflicts in ${duration} seconds.`);
+                    showMessage(
+                        this.plugin.i18n.syncCompletedWithConflicts
+                            .replace("{{duration}}", duration)
+                            .replace("{{localModified}}", localModified.toString())
+                            .replace("{{remoteModified}}", remoteModified.toString())
+                            .replace("{{localDeleted}}", localDeleted.toString())
+                            .replace("{{remoteDeleted}}", remoteDeleted.toString()),
+                        6000
+                    );
+                consoleWarn(`Sync completed with conflicts in ${duration} seconds - ${localModified} modified locally, ${remoteModified} modified remotely, ${localDeleted} deleted locally, ${remoteDeleted} deleted remotely.`);
                 this.setSyncStatus(SyncStatus.DoneWithConflict);
             } else {
+                const localModified = this.locallyUpdatedFiles.size;
+                const remoteModified = this.remotelyUpdatedFiles.size;
+                const localDeleted = this.localDeleted;
+                const remoteDeleted = this.remoteDeleted;
+
                 if (persistentMessage)
-                    showMessage(this.plugin.i18n.syncCompletedSuccessfully.replace("{{duration}}", duration), 6000);
-                consoleLog(`Sync completed successfully in ${duration} seconds!`);
+                    showMessage(
+                        this.plugin.i18n.syncCompletedSuccessfully
+                            .replace("{{duration}}", duration)
+                            .replace("{{localModified}}", localModified.toString())
+                            .replace("{{remoteModified}}", remoteModified.toString())
+                            .replace("{{localDeleted}}", localDeleted.toString())
+                            .replace("{{remoteDeleted}}", remoteDeleted.toString()),
+                        6000
+                    );
+                consoleLog(`Sync completed successfully in ${duration} seconds - ${localModified} modified locally, ${remoteModified} modified remotely, ${localDeleted} deleted locally, ${remoteDeleted} deleted remotely.`);
                 this.setSyncStatus(SyncStatus.Done);
             }
 
@@ -1015,6 +1049,8 @@ export class SyncManager {
             this.conflictDetected = false;
             this.locallyUpdatedFiles.clear();
             this.remotelyUpdatedFiles.clear();
+            this.localDeleted = 0;
+            this.remoteDeleted = 0;
             this.cleanupWebSocketRequestIds();
             this.disconnectRemoteOutputWebSocket();
         }
@@ -1628,11 +1664,13 @@ export class SyncManager {
                 break;
 
             case SyncFileOperationType.Delete:
-                await SyncUtils.deleteFile(filePath, destination);
+                await SyncUtils.deleteFile(filePath, destination)
+                destination.isLocal() ? this.localDeleted++ : this.remoteDeleted++;
                 break;
 
             case SyncFileOperationType.DeleteAndSync:
-                await SyncUtils.deleteFile(filePath, destination);
+                await SyncUtils.deleteFile(filePath, destination)
+                destination.isLocal() ? this.localDeleted++ : this.remoteDeleted++;
 
                 await this.executeSyncOperation({
                     operationType: SyncFileOperationType.Sync,
