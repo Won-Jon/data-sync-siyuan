@@ -961,7 +961,7 @@ export class SyncManager {
             SyncUtils.checkRemotes(remotes);
 
             if (persistentMessage)
-                showMessage(this.plugin.i18n.syncingWithRemote.replace("{{remoteName}}", remotes[1].name), 0, "info", "mainSyncNotification");
+                showMessage(this.plugin.i18n.syncingWithRemote.replace("{{remoteName}}", remotes[1].name), 5000, "info", "mainSyncNotification");
 
             consoleLog(`Syncing with remote server ${remotes[1].name}...`);
 
