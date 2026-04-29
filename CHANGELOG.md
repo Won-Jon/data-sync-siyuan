@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.2
+
+- Update the sync message with some more details
+- Fix the sync notification not disappearing
+
 ## 1.5.1
 
 - Fix history tracking for the remote
