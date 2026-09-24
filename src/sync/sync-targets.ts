@@ -1,3 +1,20 @@
+import { filterSyncTargets, SyncConfig } from "@/libs/sync-config";
+
+/** The fixed (non-notebook) directories this plugin syncs — shared with the settings UI. */
+export const SYNC_DIR_PATHS = [
+    "data/assets",
+    "data/plugins",
+    "data/templates",
+    "data/widgets",
+    "data/emojis",
+    "data/storage/av",
+    "data/storage/riff",
+    "data/storage/petal",
+    "data/snippets",
+    "conf/appearance/themes",
+    "conf/appearance/icons",
+];
+
 export interface SyncTarget {
     path: string;
     excludedItems?: string[];
@@ -14,12 +31,14 @@ export interface SyncTarget {
 export interface SyncTargetsConfig {
     notebooks: Notebook[];
     trackConflicts: boolean;
+    /** M5: user selection — deselected targets are never compared or transferred. */
+    syncConfig?: SyncConfig;
 }
 
 export function getSyncTargets(config: SyncTargetsConfig): SyncTarget[] {
-    const { notebooks, trackConflicts } = config;
+    const { notebooks, trackConflicts, syncConfig } = config;
 
-    return [
+    const targets: SyncTarget[] = [
         // Notebook directories
         ...notebooks.map(notebook => ({
             path: `data/${notebook.id}`,
@@ -69,6 +88,9 @@ export function getSyncTargets(config: SyncTargetsConfig): SyncTarget[] {
         // Directories only if missing
         {
             path: "data/storage/petal",
+            // Never copy this plugin's own settings to the peer: they hold the peer URL
+            // and token, so a fresh device would end up pointing at itself.
+            excludedItems: ["better-sync"],
             options: { onlyIfMissing: true, avoidDeletions: true }
         },
         {
@@ -76,4 +98,8 @@ export function getSyncTargets(config: SyncTargetsConfig): SyncTarget[] {
             options: { onlyIfMissing: true, avoidDeletions: true }
         },
     ];
+
+    if (!syncConfig) return targets;
+
+    return filterSyncTargets(targets, syncConfig, notebooks.map(notebook => notebook.id));
 }

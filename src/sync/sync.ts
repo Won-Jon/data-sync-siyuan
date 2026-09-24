@@ -2,10 +2,11 @@ import {
     getRepoSnapshots,
     createSnapshot,
     getFileBlob,
+    getRequestTimeoutMs,
     lsNotebooks,
     readDir,
+    READ_ONLY_RETRIES,
     reloadFiletree,
-    getUnusedAssets,
     requestWithHeaders,
     upload
 } from "@/api";
@@ -13,8 +14,34 @@ import BetterSyncPlugin from "..";
 import { IProtyle, Protyle, showMessage } from "siyuan";
 import { ConflictHandler, LOCK_FILE, Remote, SYNC_CONFIG_DIR, StorageItem, SyncHistory, SyncUtils, WebSocketManager, getSyncTargets } from "@/sync";
 import { Payload } from "@/libs/payload";
-import { SyncStatus, SyncStatusCallback, SyncFileResult, SyncFileOperation, SyncFileOperationType } from "@/types/sync-status";
+import { withOperationLimit, isTransferCancelled, resetTransferCancel, TransferCancelledError } from "@/libs/concurrency";import { SyncStatus, SyncStatusCallback, SyncFileResult, SyncFileOperation, SyncFileOperationType } from "@/types/sync-status";
+import { SyncProgress, SyncProgressCallback, idleProgress } from "@/types/progress";
 import { consoleError, consoleLog, consoleWarn, SessionLog } from "@/logging";
+import {
+    decideInitiation,
+    DEFAULT_SYNC_ROLE,
+    InitiationCode,
+    isLockStale,
+    lockAgeSeconds,
+    LOCK_HEARTBEAT_MS,
+    parseLockContent,
+    parseRoleDeclaration,
+    resolveDirectionOwner,
+    RoleDeclaration,
+    ROLE_FILE_PATH,
+    serializeLockContent,
+    SyncLockContent,
+    SyncRole,
+    SyncTrigger,
+} from "@/libs/roles";
+
+import {
+    defaultSyncConfig,
+    parseSyncConfig,
+    shouldSyncFile,
+    SYNC_CONFIG_FILE,
+    SyncConfig,
+} from "@/libs/sync-config";
 
 export class SyncManager {
     // Plugin instance
@@ -35,6 +62,13 @@ export class SyncManager {
         Remote.default(),
         Remote.empty()
     ];
+
+    /**
+     * Progress of the current (or last) sync, pushed to the UI so a long sync is not
+     * mistaken for a hung one.
+     */
+    private progress: SyncProgress = idleProgress();
+    private progressCallbacks: SyncProgressCallback[] = [];
 
     /**
      * Map of loaded Protyles, where the key is the file path and the value is the Protyle instance.
@@ -130,6 +164,30 @@ export class SyncManager {
     private setSyncStatus(status: SyncStatus) {
         this.syncStatus = status;
         this.statusCallbacks.forEach(callback => callback(status));
+    }
+
+    /**
+     * Subscribe to sync progress updates. The callback is invoked immediately with the
+     * current value, then on every change.
+     */
+    onProgressChange(callback: SyncProgressCallback) {
+        this.progressCallbacks.push(callback);
+        callback(this.progress);
+    }
+
+    getProgress(): SyncProgress {
+        return this.progress;
+    }
+
+    private updateProgress(patch: Partial<SyncProgress>) {
+        this.progress = { ...this.progress, ...patch };
+        for (const callback of this.progressCallbacks) {
+            try {
+                callback(this.progress);
+            } catch (error) {
+                consoleError("Progress callback failed:", error);
+            }
+        }
     }
 
     /**
@@ -256,6 +314,11 @@ export class SyncManager {
 
     /* Lock management */
 
+    /** When the current locks were taken (written into the lock as `startedAt`). */
+    private lockStartedAt: number = 0;
+    /** Interval that renews the lock heartbeat while a sync is running. */
+    private lockHeartbeat: number = 0;
+
     /**
      * Acquire a lock for the specified remote.
      * This is used to prevent concurrent sync operations on the same remote.
@@ -264,22 +327,78 @@ export class SyncManager {
      */
     private async acquireLock(remote: Remote): Promise<void> {
         const lockParent = "data/.siyuan/sync";
-        const resDir = await readDir(lockParent, remote.url, SyncUtils.getHeaders(remote.key), 5000);
+        // The lock probe used to be capped at 5s, which is shorter than the time a
+        // sleeping mobile peer needs to answer its first request (7s+ observed).
+        const resDir = await readDir(lockParent, remote.url, SyncUtils.getHeaders(remote.key), getRequestTimeoutMs(), READ_ONLY_RETRIES);
         const lockFileInfo = resDir?.find(file => file.name === "lock");
         const now = Date.now();
 
         if (lockFileInfo) {
-            const lockAge = now - (lockFileInfo.updated * 1000);
-            const fiveMinutesInMs = 5 * 60 * 1000;
+            const lockUpdatedMs = lockFileInfo.updated * 1000;
+            // The lock now carries a heartbeat, so "abandoned" means "heartbeat stopped"
+            // instead of "the file is older than five minutes" — a long sync no longer
+            // looks abandoned half way through.
+            const content = await this.readLockContent(remote, lockParent);
+            const stale = isLockStale(content, lockUpdatedMs, now);
+            const ageSeconds = lockAgeSeconds(content, lockUpdatedMs, now);
+            const ownInstanceId = this.remotes[0].instanceId;
+            const holder = content?.instanceId ?? "";
 
-            if (lockAge > fiveMinutesInMs)
-                consoleLog(`Lock file is ${Math.round(lockAge / 1000)} seconds old, ignoring stale lock for ${remote.name}`);
-            else
-                throw new Error(this.plugin.i18n.syncLockAlreadyExists.replace("{{remoteName}}", remote.name));
+            if (stale) {
+                consoleLog(`Lock file has no heartbeat for ${ageSeconds}s, ignoring stale lock for ${remote.name}`);
+            } else if (ownInstanceId && holder === ownInstanceId) {
+                consoleWarn(`Lock for ${remote.name} was created by this device ${ageSeconds}s ago and never released (interrupted sync); replacing it.`);
+            } else {
+                throw new Error(
+                    this.plugin.i18n.syncLockAlreadyExists
+                        .replace(/{{remoteName}}/g, content?.nickname || remote.name)
+                        .replace("{{age}}", String(ageSeconds))
+                );
+            }
         }
 
-        const file = new File([], "lock", { type: "text/plain", lastModified: now });
-        await SyncUtils.putFile(`${lockParent}/lock`, file, remote.url, remote.key, now);
+        await this.writeLock(remote, now);
+    }
+
+    /** Write (or renew) the lock file, heartbeat included. */
+    private async writeLock(remote: Remote, now: number = Date.now()): Promise<void> {
+        const content: SyncLockContent = {
+            instanceId: this.remotes[0].instanceId ?? "",
+            nickname: this.plugin.settingsManager.getPref("siyuanNickname") || undefined,
+            direction: "bidirectional",
+            startedAt: this.lockStartedAt || now,
+            heartbeatAt: now,
+        };
+        const file = new File([serializeLockContent(content)], "lock", { type: "text/plain", lastModified: now });
+        await SyncUtils.putFile(`data/.siyuan/sync/lock`, file, remote.url, remote.key, now);
+    }
+
+    /** Read the lock content (older locks hold a bare instance id; empty means none). */
+    private async readLockContent(remote: Remote, lockParent: string): Promise<SyncLockContent | null> {
+        try {
+            const blob = await getFileBlob(`${lockParent}/lock`, remote.url, SyncUtils.getHeaders(remote.key));
+            return blob ? parseLockContent(await blob.text()) : null;
+        } catch (error) {
+            consoleWarn(`Could not read the lock of ${remote.name}:`, error);
+            return null;
+        }
+    }
+
+    /** Renew both locks while the sync runs, so the peer sees "busy", not "abandoned". */
+    private startLockHeartbeat(remotes: [Remote, Remote]): void {
+        this.stopLockHeartbeat();
+        this.lockHeartbeat = window.setInterval(() => {
+            remotes.forEach(remote => {
+                this.writeLock(remote).catch(error => consoleWarn("Failed to renew the sync lock:", error));
+            });
+        }, LOCK_HEARTBEAT_MS);
+    }
+
+    private stopLockHeartbeat(): void {
+        if (this.lockHeartbeat) {
+            window.clearInterval(this.lockHeartbeat);
+            this.lockHeartbeat = 0;
+        }
     }
 
     /**
@@ -307,11 +426,15 @@ export class SyncManager {
     private async acquireAllLocks(remotes: [Remote, Remote] = this.copyRemotes(this.remotes)): Promise<void> {
         SyncUtils.checkRemotes(remotes);
 
+        this.lockStartedAt = Date.now();
+
         // Acquire the remote lock first
         await this.acquireLock(remotes[1]);
 
         // Acquire the local lock
         await this.acquireLock(remotes[0]);
+
+        this.startLockHeartbeat(remotes);
 
         consoleLog("Acquired sync locks.");
     }
@@ -324,7 +447,134 @@ export class SyncManager {
     private async releaseAllLocks(remotes: [Remote, Remote] = this.copyRemotes(this.remotes)): Promise<void> {
         SyncUtils.checkRemotes(remotes);
 
+        this.stopLockHeartbeat();
+
         await Promise.allSettled(remotes.map(remote => this.releaseLock(remote)));
+    }
+
+    /* Roles and direction ownership (M4) */
+
+    /** M5: cached user selection (selective sync). */
+    private syncConfig: SyncConfig | null = null;
+
+    /** Load (and cache) the selective-sync configuration. */
+    async getSyncConfig(): Promise<SyncConfig> {
+        if (!this.syncConfig) {
+            try {
+                this.syncConfig = parseSyncConfig(await this.plugin.loadData(SYNC_CONFIG_FILE));
+            } catch (error) {
+                consoleWarn("Could not read the selective sync configuration, syncing everything:", error);
+                this.syncConfig = defaultSyncConfig();
+            }
+        }
+        return this.syncConfig;
+    }
+
+    /** Call after the user edits the selection so the next run picks it up. */
+    invalidateSyncConfig(): void {
+        this.syncConfig = null;
+    }
+
+    /** M5: is this path inside the selected scope? Every transfer funnels through here. */
+    private async isPathSyncable(filePath: string): Promise<boolean> {
+        try {
+            return shouldSyncFile(filePath, await this.getSyncConfig());
+        } catch (error) {
+            consoleWarn("Could not evaluate the selective sync scope, allowing the path:", error);
+            return true;
+        }
+    }
+
+    private getLocalRole(): SyncRole {
+        const role = this.plugin.settingsManager.getPref("syncRole");
+        return role === "host" || role === "peer" || role === "manual" ? role : DEFAULT_SYNC_ROLE;
+    }
+
+    /**
+     * Instant (per-file) pushes are for the side that owns the pair's direction — otherwise
+     * both devices would push their edits at each other.
+     */
+    private instantSyncAllowed(): boolean {
+        if (this.getLocalRole() !== "host") return false;
+
+        const localId = this.remotes[0].instanceId ?? "";
+        const remoteId = this.remotes[1].instanceId ?? "";
+        if (!localId || !remoteId) return true;
+
+        const setting = this.plugin.settingsManager.getPref("directionOwner") || "auto";
+        return resolveDirectionOwner(localId, remoteId, setting) === localId;
+    }
+
+    /**
+     * Publish our role, read the peer's role and decide whether this device may start now.
+     *
+     * This is the "handshake": it is what stops two devices that both declared themselves
+     * hosts from taking turns overwriting each other.
+     */
+    private async checkInitiationAllowed(
+        remotes: [Remote, Remote],
+        trigger: SyncTrigger
+    ): Promise<{ allowed: boolean; code: InitiationCode; message?: string }> {
+        const localRole = this.getLocalRole();
+        const directionSetting = this.plugin.settingsManager.getPref("directionOwner") || "auto";
+        const localInstanceId = this.remotes[0].instanceId ?? "";
+        const nickname = this.plugin.settingsManager.getPref("siyuanNickname") || undefined;
+
+        // Publish our declaration first, so the peer can run the same check against us.
+        try {
+            const declaration: RoleDeclaration = {
+                role: localRole,
+                instanceId: localInstanceId,
+                nickname,
+                updatedAt: Date.now(),
+            };
+            const file = new File([JSON.stringify(declaration)], "role.json", { type: "application/json", lastModified: Date.now() });
+            await SyncUtils.putFile(ROLE_FILE_PATH, file, remotes[0].url, remotes[0].key, Date.now());
+        } catch (error) {
+            consoleWarn("Could not publish the local role declaration:", error);
+        }
+
+        let remoteRole: SyncRole | null = null;
+        let remoteNickname: string | undefined;
+        let remoteInstanceId = this.remotes[1].instanceId ?? "";
+        try {
+            const blob = await getFileBlob(ROLE_FILE_PATH, remotes[1].url, SyncUtils.getHeaders(remotes[1].key));
+            const declaration = parseRoleDeclaration(blob ? await blob.text() : null);
+            if (declaration) {
+                remoteRole = declaration.role;
+                remoteNickname = declaration.nickname;
+                remoteInstanceId = declaration.instanceId || remoteInstanceId;
+            }
+        } catch (error) {
+            consoleWarn("Could not read the peer role declaration:", error);
+        }
+
+        const directionOwner = resolveDirectionOwner(localInstanceId, remoteInstanceId, directionSetting);
+        const decision = decideInitiation({ localRole, remoteRole, trigger, directionOwner, localInstanceId });
+        if (decision.allowed) return { allowed: true, code: decision.code };
+
+        const peerName = remoteNickname || remotes[1].name || remotes[1].url;
+        const ownerLabel = directionOwner === localInstanceId
+            ? (nickname || "this device")
+            : peerName;
+
+        // Flat i18n keys on purpose: the i18n loader hands over a flat map.
+        const keyByCode: Record<string, string> = {
+            bothHostsNotOwner: "syncRefusedBothHosts",
+            bothPeers: "syncRefusedBothPeers",
+            localIsPeer: "syncRefusedLocalPeer",
+            localIsManual: "syncRefusedLocalManual",
+            remoteRoleUnknown: "syncRefusedUnknownPeer",
+        };
+
+        return {
+            allowed: false,
+            code: decision.code,
+            message: (this.plugin.i18n[keyByCode[decision.code]] ?? decision.code)
+                .replace(/{{peerName}}/g, peerName)
+                .replace(/{{peerUrl}}/g, remotes[1].url)
+                .replace(/{{owner}}/g, ownerLabel),
+        };
     }
 
     /**
@@ -385,6 +635,10 @@ export class SyncManager {
                 if (this.plugin.settingsManager.getPref("instantSync") !== true)
                     break;
 
+                // M4: instant pushes belong to the side that owns the direction.
+                if (!this.instantSyncAllowed())
+                    break;
+
                 const useWebSocket = await this.fetchAndSetRemoteAppId(this.remotes) && await this.shouldUseWebSocket();
 
                 if (useWebSocket) {
@@ -409,6 +663,10 @@ export class SyncManager {
 
             case "/api/filetree/createDoc":
                 if (this.plugin.settingsManager.getPref("instantSync") !== true)
+                    break;
+
+                // M4: instant pushes belong to the side that owns the direction.
+                if (!this.instantSyncAllowed())
                     break;
 
                 const createDocPayload = JSON.parse(init.body as string) as CreateDocRequest;
@@ -437,6 +695,10 @@ export class SyncManager {
 
             case "/api/notebook/createNotebook":
                 if (this.plugin.settingsManager.getPref("instantSync") !== true)
+                    break;
+
+                // M4: instant pushes belong to the side that owns the direction.
+                if (!this.instantSyncAllowed())
                     break;
 
                 const apiResponse = await (await fetchPromise).clone().json();
@@ -478,6 +740,9 @@ export class SyncManager {
         protyle: IProtyle
     ) {
         if (this.plugin.settingsManager.getPref("instantSync") !== true) return;
+
+        // M4: instant pushes belong to the side that owns the direction.
+        if (!this.instantSyncAllowed()) return;
 
         const debounceTime = this.plugin.settingsManager.getPref("transactionsDebounceTime") || 5000;
 
@@ -945,20 +1210,50 @@ export class SyncManager {
      */
     async syncHandler(
         persistentMessage: boolean = true,
-        remotes: [Remote, Remote] = this.copyRemotes(this.remotes)
+        remotes: [Remote, Remote] = this.copyRemotes(this.remotes),
+        trigger: SyncTrigger = "manual"
     ) {
         const startTime = Date.now();
         let savedError: Error | null = null;
         let promise: Promise<void> | null = null;
         let locked = false;
+        let started = false;
         try {
             if (this.getSyncStatus() === SyncStatus.InProgress) {
-                consoleWarn("Sync is already in progress.");
+                consoleWarn("Sync is already in progress, ignoring this request.");
+                // Give an explicit reminder instead of silently doing nothing: the user
+                // otherwise has no idea the request was dropped.
+                this.plugin.notifySyncAlreadyRunning(this.progress);
                 return;
             }
 
+            started = true;
+            resetTransferCancel();
             this.setSyncStatus(SyncStatus.InProgress);
             SyncUtils.checkRemotes(remotes);
+
+            // M4: roles + direction ownership decide whether this device may start at all.
+            // Refusing here means zero file transfer, not a half-done sync.
+            const gate = await this.checkInitiationAllowed(remotes, trigger);
+            if (!gate.allowed) {
+                started = false;
+                this.setSyncStatus(SyncStatus.None);
+                this.updateProgress(idleProgress());
+                this.plugin.notifySyncRefused(gate.message ?? String(gate.code));
+                consoleWarn(`Sync refused (${gate.code}): ${gate.message}`);
+                return;
+            }
+
+            this.updateProgress({
+                phase: "preparing",
+                targetsStarted: 0,
+                targetTotal: 0,
+                done: 0,
+                total: 0,
+                currentFile: undefined,
+                startedAt: startTime,
+                finishedAt: undefined,
+            });
 
             if (persistentMessage)
                 showMessage(this.plugin.i18n.syncingWithRemote.replace("{{remoteName}}", remotes[1].name), 5000, "info", "mainSyncNotification");
@@ -978,8 +1273,15 @@ export class SyncManager {
             await this.syncWithRemote(remotes, promise);
         } catch (error) {
             savedError = error;
-            this.setSyncStatus(SyncStatus.Failed);
+            const cancelled = error instanceof TransferCancelledError || (error as any)?.name === "TransferCancelledError";
+            this.setSyncStatus(cancelled ? SyncStatus.None : SyncStatus.Failed);
+            this.updateProgress({ phase: cancelled ? "cancelled" : "failed", finishedAt: Date.now() });
         } finally {
+            // An ignored ("already running") request must not fall through into the
+            // reporting below: it used to log a sync, clear the counters and even show
+            // a success toast for a sync it never ran.
+            if (!started) return;
+
             if (locked) await this.releaseAllLocks(remotes);
             consoleLog("Released all sync locks.");
 
@@ -990,16 +1292,43 @@ export class SyncManager {
                 this.dismissMainSyncNotification();
 
             if (savedError !== null) {
-                consoleError("Error during sync:", savedError);
+                const cancelled = savedError instanceof TransferCancelledError || (savedError as any)?.name === "TransferCancelledError";
 
-                showMessage(
-                    this.plugin.i18n.syncWithRemoteFailed
-                        .replace("{{remoteName}}", remotes[1].name)
-                        .replace("{{error}}", savedError.message)
-                        .replace("{{duration}}", duration),
-                    6000,
-                    "error"
-                );
+                if (cancelled) {
+                    consoleWarn("Sync cancelled by the user.");
+                    try {
+                        await reloadFiletree(remotes[0].url, SyncUtils.getHeaders(remotes[0].key));
+                        if (this.locallyUpdatedFiles.size > 0) await this.reloadProtyles();
+                    } catch (refreshError) {
+                        consoleWarn("Failed to refresh the UI after a cancelled sync:", refreshError);
+                    }
+                    showMessage(this.plugin.i18n.syncCancelled, 8000, "info");
+                } else {
+                    consoleError("Error during sync:", savedError);
+
+                    // A failed sync may still have transferred a part of the data: the
+                    // transfers are applied file by file and never rolled back. Refresh the
+                    // UI so the user does not have to reopen SiYuan to see what arrived.
+                    try {
+                        await reloadFiletree(remotes[0].url, SyncUtils.getHeaders(remotes[0].key));
+                        if (this.locallyUpdatedFiles.size > 0) await this.reloadProtyles();
+                    } catch (refreshError) {
+                        consoleWarn("Failed to refresh the UI after a failed sync:", refreshError);
+                    }
+
+                    const timeoutHint = /timeout/i.test(savedError.message)
+                        ? this.plugin.i18n.syncFailedTimeoutHint
+                        : "";
+
+                    showMessage(
+                        this.plugin.i18n.syncWithRemoteFailed
+                            .replace("{{remoteName}}", remotes[1].name)
+                            .replace("{{error}}", savedError.message)
+                            .replace("{{duration}}", duration) + timeoutHint,
+                        6000,
+                        "error"
+                    );
+                }
             } else if (this.conflictDetected) {
                 const localModified = this.locallyUpdatedFiles.size;
                 const remoteModified = this.remotelyUpdatedFiles.size;
@@ -1018,6 +1347,7 @@ export class SyncManager {
                     );
                 consoleWarn(`Sync completed with conflicts in ${duration} seconds - ${localModified} modified locally, ${remoteModified} modified remotely, ${localDeleted} deleted locally, ${remoteDeleted} deleted remotely.`);
                 this.setSyncStatus(SyncStatus.DoneWithConflict);
+                this.updateProgress({ phase: "done", finishedAt: Date.now() });
             } else {
                 const localModified = this.locallyUpdatedFiles.size;
                 const remoteModified = this.remotelyUpdatedFiles.size;
@@ -1036,6 +1366,7 @@ export class SyncManager {
                     );
                 consoleLog(`Sync completed successfully in ${duration} seconds - ${localModified} modified locally, ${remoteModified} modified remotely, ${localDeleted} deleted locally, ${remoteDeleted} deleted remotely.`);
                 this.setSyncStatus(SyncStatus.Done);
+                this.updateProgress({ phase: "done", finishedAt: Date.now() });
             }
 
             await SyncUtils.writeSyncLog(
@@ -1115,8 +1446,10 @@ export class SyncManager {
 
         await this.fetchAndSetRemoteAppId(remotes);
 
-        // Get sync targets using the external function
-        const syncTargets = getSyncTargets({ notebooks, trackConflicts });
+        // Get sync targets using the external function (M5: the user's selection is applied here)
+        const syncConfig = await this.getSyncConfig();
+        const syncTargets = getSyncTargets({ notebooks, trackConflicts, syncConfig });
+        this.updateProgress({ phase: "scanning", targetTotal: syncTargets.length });
 
         // Execute all sync operations
         const promises = syncTargets.map(target => {
@@ -1139,6 +1472,8 @@ export class SyncManager {
         consoleLog(`Starting sync operations for ${notebooks.length} notebooks and ${syncTargets.length - notebooks.length * 2} other directories...`);
 
         await Promise.all(promises);
+        if (isTransferCancelled()) throw new TransferCancelledError();
+        this.updateProgress({ phase: "finalizing" });
 
         reloadFiletree(remotes[0].url, SyncUtils.getHeaders(remotes[0].key));
         reloadFiletree(remotes[1].url, SyncUtils.getHeaders(remotes[1].key));
@@ -1286,13 +1621,20 @@ export class SyncManager {
             return;
         }
 
+        this.updateProgress({
+            targetsStarted: this.progress.targetsStarted + 1,
+            phase: this.progress.total > 0 ? "transferring" : "scanning",
+        });
+
         remotes = await this.scanDirectory(remotes, excludedItems);
         if (!remotes) {
             consoleWarn(`Failed to scan directory ${path}. Skipping sync.`);
             return;
         }
+        if (isTransferCancelled()) throw new TransferCancelledError();
 
         await this.syncDirWork(remotes, options);
+        if (isTransferCancelled()) throw new TransferCancelledError();
     }
 
     /**
@@ -1426,6 +1768,7 @@ export class SyncManager {
             return true;
         });
 
+        this.updateProgress({ phase: "transferring", total: this.progress.total + sanitizedOperations.length });
         await this.executeOperationsByPriority(sanitizedOperations);
     }
 
@@ -1446,11 +1789,22 @@ export class SyncManager {
         ];
 
         for (const filter of priorityGroups) {
+            // Operations swallow their own errors (allSettled), so a cancel has to be
+            // surfaced explicitly here, otherwise the sync would keep walking through
+            // the remaining groups and even report success.
+            if (isTransferCancelled()) throw new TransferCancelledError();
+
             const group = operations.filter(filter);
             if (group.length > 0) {
                 await Promise.allSettled(group.map(operation => {
-                    consoleLog("Executing sync operation:", operation);
-                    return this.executeSyncOperation(operation);
+                    const filePath = operation.source?.filePath ?? operation.destination?.filePath;
+                    return withOperationLimit(() => {
+                        consoleLog("Executing sync operation:", operation);
+                        this.updateProgress({ currentFile: filePath });
+                        return this.executeSyncOperation(operation);
+                    }).finally(() => {
+                        this.updateProgress({ done: this.progress.done + 1 });
+                    });
                 }));
             }
         }
@@ -1643,6 +1997,13 @@ export class SyncManager {
             return;
         }
 
+        // M5: a deselected file is never transferred — no matter whether the operation came
+        // from the full scan or from an instant-sync hook.
+        if (!(await this.isPathSyncable(filePath))) {
+            consoleLog(`Skipping ${filePath}: outside the selected sync scope.`);
+            return;
+        }
+
         switch (operation.operationType) {
             case SyncFileOperationType.Sync:
                 // Multiply the timestamp by 1000 because `putFile` converts it automatically
@@ -1757,8 +2118,8 @@ export class SyncManager {
 
         for (let i = 0; i < snapshots.length; i++) {
             if (!snapshots[i] || snapshots[i].snapshots.length <= 0) {
-                showMessage(this.plugin.i18n.initializeDataRepo.replace(/{{remoteName}}/g, remotes[i].name), 6000);
-                consoleWarn(`Failed to fetch snapshots for ${remotes[i].name}, skipping snapshot creation.`);
+                showMessage(this.plugin.i18n.snapshotRepoNotInitialized.replace(/{{remoteName}}/g, remotes[i].name), 10000);
+                consoleWarn(`Failed to fetch snapshots for ${remotes[i].name}, skipping snapshot creation. Initialize the data repo key on that device (设置 → 账号与同步 → 本地数据仓库).`);
                 return;
             }
 

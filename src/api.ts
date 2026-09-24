@@ -7,8 +7,35 @@
  */
 
 import { fetchPost, fetchSyncPost, IWebSocketData } from "siyuan";
-import { consoleError, consoleLog } from "./logging";
+import { consoleError, consoleLog, consoleWarn } from "./logging";
+import { withConcurrencyLimit, registerAbortableController, unregisterAbortableController, isTransferCancelled, TransferCancelledError } from "./libs/concurrency";
 
+
+export const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
+
+/** Retry budget for read-only requests: a mobile peer may still be waking up. */
+export const READ_ONLY_RETRIES = 2;
+
+let requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
+
+/**
+ * Timeout applied to every request that does not pass its own value.
+ * Kept in sync with the `requestTimeoutMs` setting: peers that are mobile
+ * devices can need far more than the old hardcoded 5s while waking up.
+ */
+export function setRequestTimeoutMs(ms: number) {
+    requestTimeoutMs = (typeof ms === "number" && isFinite(ms) && ms > 0) ? ms : DEFAULT_REQUEST_TIMEOUT_MS;
+}
+
+export function getRequestTimeoutMs(): number {
+    return requestTimeoutMs;
+}
+
+const RETRY_BASE_DELAY_MS = 1000;
+
+function delay(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 export async function request(url: string, data: any) {
     let response: IWebSocketData = await fetchSyncPost(url, data);
@@ -16,10 +43,11 @@ export async function request(url: string, data: any) {
     return res;
 }
 
-export async function requestWithHeaders(url: string, data: any, headers?: Record<string, string>, timeoutMs: number = 15000): Promise<any> {
+function requestOnce(url: string, data: any, headers: Record<string, string> | undefined, timeoutMs: number): Promise<any> {
     return new Promise((resolve, reject) => {
+        const startedAt = Date.now();
         const timeoutId = setTimeout(() => {
-            reject(new Error(`Request timeout for ${url}`));
+            reject(new Error(`Request timeout for ${url} (no response within ${timeoutMs}ms)`));
         }, timeoutMs);
 
         try {
@@ -28,16 +56,54 @@ export async function requestWithHeaders(url: string, data: any, headers?: Recor
                 if (response.code === 0) {
                     resolve(response.data);
                 } else {
-                    consoleError(`Request failed for ${url}:`, response.msg || 'Unknown error');
+                    consoleError(`Request to ${url} failed in ${Date.now() - startedAt}ms:`, response.msg || 'Unknown error');
                     resolve(null);
                 }
             }, headers);
         } catch (error) {
             clearTimeout(timeoutId);
-            consoleError(`Request failed for ${url}:`, error);
+            consoleError(`Request to ${url} threw:`, error);
             reject(error);
         }
     });
+}
+
+/**
+ * Send a request to a SiYuan kernel (the local one when `url` has no host).
+ *
+ * @param retries Extra attempts when the request never completed (timeout /
+ *        network error). Only pass this for read-only calls: retrying a write
+ *        is not safe.
+ */
+export async function requestWithHeaders(
+    url: string,
+    data: any,
+    headers?: Record<string, string>,
+    timeoutMs: number = requestTimeoutMs,
+    retries: number = 0
+): Promise<any> {
+    let lastError: Error = new Error(`Request failed for ${url}`);
+
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            // Every request goes through the shared budget: this is what keeps a large
+            // sync from flooding a mobile peer with hundreds of parallel requests.
+            return await withConcurrencyLimit(() => requestOnce(url, data, headers, timeoutMs));
+        } catch (error) {
+            lastError = error instanceof Error ? error : new Error(String(error));
+            // A user cancellation must not be retried.
+            if (lastError instanceof TransferCancelledError) break;
+
+            if (attempt < retries) {
+                const waitMs = RETRY_BASE_DELAY_MS * (attempt + 1);
+                consoleWarn(`Request to ${url} failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${waitMs}ms:`, lastError.message);
+                await delay(waitMs);
+            }
+        }
+    }
+
+    consoleError(`Request to ${url} failed after ${retries + 1} attempt(s):`, lastError.message);
+    throw lastError;
 };
 
 // **************************************** Noteboook ****************************************
@@ -389,15 +455,18 @@ export async function copyFile(src: string, dest: string, urlPrefix: string = ''
     return requestWithHeaders(url, data, headers);
 }
 
-export const getFileBlob = async (path: string, urlPrefix: string = '', headers?: Record<string, string>, timeoutMs: number = 5000): Promise<Blob | null> => {
+export const getFileBlob = async (path: string, urlPrefix: string = '', headers?: Record<string, string>, timeoutMs: number = requestTimeoutMs): Promise<Blob | null> => {
     const endpoint = `${urlPrefix}/api/file/getFile`;
 
-    try {
-        const timeoutPromise = new Promise<never>((_, reject) => {
-            setTimeout(() => reject(new Error(`Request timeout for ${endpoint}`)), timeoutMs);
-        });
+    // The request must be *aborted* on timeout, not merely raced against a timer: a
+    // raced fetch keeps holding its concurrency slot, so a single wedged connection
+    // blocks the queue (measured: 9.3s of head-of-line blocking with the limit set to 1).
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    registerAbortableController(controller);
 
-        const fetchPromise = fetch(endpoint, {
+    try {
+        const response = await withConcurrencyLimit(() => fetch(endpoint, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -405,10 +474,13 @@ export const getFileBlob = async (path: string, urlPrefix: string = '', headers?
             },
             body: JSON.stringify({
                 path: path
-            })
-        });
+            }),
+            signal: controller.signal,
+        }));
 
-        const response = await Promise.race([fetchPromise, timeoutPromise]);
+        // Headers are in: stop the abort timer before reading the body, so a large file
+        // is not cut off halfway through the download.
+        clearTimeout(timeoutId);
 
         if (!response.ok || response.status !== 200) {
             return null;
@@ -417,8 +489,19 @@ export const getFileBlob = async (path: string, urlPrefix: string = '', headers?
         const data = await response.blob();
         return data;
     } catch (error) {
+        if ((error as any)?.name === 'AbortError') {
+            // A user cancellation aborts the same controller as the timeout: tell them apart.
+            if (isTransferCancelled()) throw new TransferCancelledError();
+
+            const timeoutError = new Error(`Request timeout for ${endpoint} (no response within ${timeoutMs}ms)`);
+            consoleError(`getFileBlob failed for ${endpoint}:`, timeoutError);
+            throw timeoutError;
+        }
         consoleError(`getFileBlob failed for ${endpoint}:`, error);
         throw error;
+    } finally {
+        clearTimeout(timeoutId);
+        unregisterAbortableController(controller);
     }
 }
 
@@ -440,16 +523,13 @@ export async function removeFile(path: string, urlPrefix: string = '', headers?:
     return requestWithHeaders(url, data, headers);
 }
 
-export async function readDir(path: string, urlPrefix: string = '', headers?: Record<string, string>, timeoutMs?: number): Promise<IResReadDir[]> {
+export async function readDir(path: string, urlPrefix: string = '', headers?: Record<string, string>, timeoutMs?: number, retries: number = 0): Promise<IResReadDir[]> {
     let data = {
         path: path
     }
     let url = `${urlPrefix}/api/file/readDir`;
 
-    if (timeoutMs)
-        return requestWithHeaders(url, data, headers, timeoutMs);
-
-    return requestWithHeaders(url, data, headers);
+    return requestWithHeaders(url, data, headers, timeoutMs ?? requestTimeoutMs, retries);
 }
 
 // **************************************** Export ****************************************

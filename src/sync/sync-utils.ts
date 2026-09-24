@@ -1,6 +1,7 @@
 import { consoleError, consoleLog } from "@/logging";
-import { getFileBlob, moveDocs, putFile, readDir, removeFile, removeIndexes, upsertIndexes } from "../api";
+import { getFileBlob, moveDocs, putFile, readDir, READ_ONLY_RETRIES, removeFile, removeIndexes, upsertIndexes } from "../api";
 import { INSTANCE_ID_FILE, Remote, StorageItem, SYNC_CONFIG_DIR, SYNC_LOGS_DIR } from "@/sync";
+import { matchesGlob } from "@/libs/sync-config";
 
 export class SyncUtils {
     /**
@@ -19,7 +20,7 @@ export class SyncUtils {
     ): Promise<StorageItem> {
         let storageItem: StorageItem = new StorageItem(path);
 
-        const dirResponse = await readDir(path, remote.url, SyncUtils.getHeaders(remote.key));
+        const dirResponse = await readDir(path, remote.url, SyncUtils.getHeaders(remote.key), undefined, READ_ONLY_RETRIES);
 
         if (!dirResponse) {
             consoleLog("No files found or invalid response for path:", path);
@@ -28,7 +29,7 @@ export class SyncUtils {
 
         const dir = dirResponse
             .filter(file => !(skipSymlinks && file.isSymlink))
-            .filter(file => !excludedItems.includes(file.name));
+            .filter(file => !excludedItems.some(pattern => matchesGlob(file.name, pattern)));
 
         if (!dir || dir.length === 0) {
             consoleLog("No files found or invalid response for path:", path);
@@ -40,13 +41,13 @@ export class SyncUtils {
             storageItem.addFileFromItem(file);
         });
 
-        // Collect all promises for subdirectories
-        const promises = dir
-            .filter(file => file.isDir)
-            .map(file => SyncUtils.getDirFilesRecursively(`${path}/${file.name}`, remote, skipSymlinks, excludedItems));
-
-        // Wait for all promises to resolve
-        const results = await Promise.all(promises);
+        // Scan subdirectories. Concurrency is bounded per HTTP request (see
+        // libs/concurrency.ts): wrapping this recursion in the limit used to deadlock
+        // the sync, because parents held slots while waiting for their children.
+        const results = await Promise.all(
+            dir.filter(file => file.isDir)
+                .map(file => SyncUtils.getDirFilesRecursively(`${path}/${file.name}`, remote, skipSymlinks, excludedItems))
+        );
 
         // Collect all items into their respective parents
         results.forEach(item => {
@@ -195,7 +196,7 @@ export class SyncUtils {
      * @returns The timestamp of the file, or 0 if not found.
      */
     static async getFileTimestamp(parent: string, fileName: string, remote: Remote): Promise<number> {
-        const dir = await readDir(parent, remote.url, SyncUtils.getHeaders(remote.key));
+        const dir = await readDir(parent, remote.url, SyncUtils.getHeaders(remote.key), undefined, READ_ONLY_RETRIES);
         const file = dir.find(file => file.name === fileName);
 
         return file ? file.updated * 1000 : 0;
@@ -223,7 +224,7 @@ export class SyncUtils {
      * @returns An array of log file names.
      */
     static async getAllSyncLogFiles(remote: Remote): Promise<IResReadDir[]> {
-        const logFiles = await readDir(SYNC_LOGS_DIR, remote.url, SyncUtils.getHeaders(remote.key));
+        const logFiles = await readDir(SYNC_LOGS_DIR, remote.url, SyncUtils.getHeaders(remote.key), undefined, READ_ONLY_RETRIES);
 
         if (!logFiles || logFiles.length === 0) return [];
 
@@ -297,7 +298,7 @@ export class SyncUtils {
 
             const dirs = await Promise.all(
                 remotes.map((remote, i) =>
-                    readDir(grandparentPaths[i], remote.url, SyncUtils.getHeaders(remote.key))
+                    readDir(grandparentPaths[i], remote.url, SyncUtils.getHeaders(remote.key), undefined, READ_ONLY_RETRIES)
                 )
             );
 
